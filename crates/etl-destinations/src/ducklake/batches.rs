@@ -112,17 +112,33 @@ fn is_duckdb_interrupt_error(error: &duckdb::Error) -> bool {
     error.to_string().contains("INTERRUPT Error: Interrupted")
 }
 
-/// Sanitized DuckDB query failure for statements that may contain row values.
-#[derive(Debug)]
-struct DuckDbSensitiveQueryError;
-
+/// Query failure whose value-bearing diagnostics require explicit opt-in.
+struct DuckDbSensitiveQueryError {
+    error: duckdb::Error,
+    sql: String,
+}
 impl fmt::Display for DuckDbSensitiveQueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DuckDB query failed; error message omitted because it may contain row values")
+        if cfg!(feature = "ducklake-query-error-details") {
+            write!(f, "{}; SQL: {}", self.error, self.sql)
+        } else {
+            write!(
+                f,
+                "DuckDB query failed; error message omitted because it may contain row values"
+            )
+        }
     }
 }
-
-impl error::Error for DuckDbSensitiveQueryError {}
+impl fmt::Debug for DuckDbSensitiveQueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+impl error::Error for DuckDbSensitiveQueryError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        if cfg!(feature = "ducklake-query-error-details") { Some(&self.error) } else { None }
+    }
+}
 
 /// Formats query context for a delete mutation without row values.
 fn format_delete_mutation_error_detail(
@@ -789,17 +805,19 @@ pub(super) async fn apply_table_batch_with_retry(
 /// mixed CDC streams can commit larger insert groups without breaking atomic
 /// ordering.
 pub(super) fn prepare_mutation_table_batches(
+    batch_size: Option<std::num::NonZeroUsize>,
     replicated_table_schema: &ReplicatedTableSchema,
     table_name: DuckLakeTableName,
     replay_epoch: String,
     tracked_mutations: Vec<TrackedTableMutation>,
 ) -> EtlResult<Vec<PreparedDuckLakeTableBatch>> {
+    let batch_size = batch_size.map_or(CDC_MUTATION_BATCH_SIZE, std::num::NonZeroUsize::get);
     let mut prepared_batches = Vec::new();
     let mut pending_mutations = Vec::new();
 
     for tracked_mutation in tracked_mutations {
         pending_mutations.push(tracked_mutation);
-        if pending_mutations.len() >= CDC_MUTATION_BATCH_SIZE {
+        if pending_mutations.len() >= batch_size {
             push_prepared_mutation_batch(
                 &mut prepared_batches,
                 replicated_table_schema,
@@ -2318,8 +2336,9 @@ fn apply_delete_mutation(
         let sql_query = format!("DELETE FROM {target_table} WHERE {where_clause};");
         conn.execute_batch(&sql_query).map_err(|error| {
             let duckdb_interrupted = is_duckdb_interrupt_error(&error);
+            let error = DuckDbSensitiveQueryError { error, sql: sql_query.clone() };
             tracing::error!(
-                error = %DuckDbSensitiveQueryError,
+                error = "DuckDB DELETE failed; row-bearing diagnostics omitted from logs",
                 table = %batch.table_name,
                 batch_id = %batch.batch_id,
                 batch_kind = batch.batch_kind.as_str(),
@@ -2349,7 +2368,7 @@ fn apply_delete_mutation(
                     chunk_count,
                     chunk.len(),
                 ),
-                source: DuckDbSensitiveQueryError
+                source: error
             )
         })?;
     }
@@ -2371,13 +2390,14 @@ fn apply_update_mutation(
     let set_clause = assignments.join(", ");
     let target_table = qualified_lake_table_name(table_name);
     let sql_query = format!("UPDATE {target_table} SET {set_clause} WHERE {predicate};");
-    conn.execute_batch(&sql_query).map_err(|_err| {
-        tracing::error!(error = %DuckDbSensitiveQueryError, "error updating rows");
+    conn.execute_batch(&sql_query).map_err(|error| {
+        let error = DuckDbSensitiveQueryError { error, sql: sql_query.clone() };
+        tracing::error!(error = "DuckDB UPDATE failed; row-bearing diagnostics omitted from logs", table = %table_name, "error updating rows");
         etl_error!(
             ErrorKind::DestinationQueryFailed,
             "DuckLake UPDATE failed",
             format_update_mutation_error_detail(&target_table, assignments.len(), !predicate.is_empty()),
-            source: DuckDbSensitiveQueryError
+            source: error
         )
     })?;
 
@@ -2640,6 +2660,11 @@ mod tests {
     ) {
         assert_eq!(error.kind(), ErrorKind::DestinationQueryFailed);
         assert_eq!(error.description(), Some(description));
+        if cfg!(feature = "ducklake-query-error-details") {
+            assert!(error.to_string().contains(sensitive_value));
+            assert!(error.to_string().contains("SQL:"));
+            return;
+        }
         assert!(!error.to_string().contains(sensitive_value));
         assert!(!error.detail().is_some_and(|detail| detail.contains(sensitive_value)));
         let source = error.source().expect("expected sanitized source");
@@ -3157,6 +3182,7 @@ mod tests {
     fn prepare_mutation_table_batches_insert_only_uses_single_upsert_operation() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            None,
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3207,6 +3233,7 @@ mod tests {
     fn prepare_mutation_table_batches_split_mixed_cdc_at_delete_boundaries() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            None,
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3259,6 +3286,7 @@ mod tests {
     fn prepare_mutation_table_batches_group_contiguous_deletes() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            None,
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3306,6 +3334,7 @@ mod tests {
     fn prepare_mutation_table_batches_group_contiguous_updates() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            None,
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3361,50 +3390,55 @@ mod tests {
 
     #[test]
     fn prepare_mutation_table_batches_split_non_inserts_at_cap() {
-        let replicated_table_schema = make_replicated_schema();
-        let tracked = (0..=CDC_MUTATION_BATCH_SIZE)
-            .map(|idx| {
-                TrackedTableMutation::new(
-                    EventSequenceKey::new(PgLsn::from(200 + idx as u64), 0),
-                    TableMutation::Delete(OldTableRow::Full(TableRow::new(vec![
-                        Cell::I32(idx as i32),
-                        Cell::String(format!("name-{idx}")),
-                    ]))),
-                )
-            })
-            .collect();
-        let batches = prepare_mutation_table_batches(
-            &replicated_table_schema,
-            ducklake_table_name(),
-            LEGACY_REPLAY_EPOCH.to_owned(),
-            tracked,
-        )
-        .unwrap();
+        for configured_size in [None, std::num::NonZeroUsize::new(CDC_MUTATION_BATCH_SIZE * 2)] {
+            let replicated_table_schema = make_replicated_schema();
+            let batch_size =
+                configured_size.map_or(CDC_MUTATION_BATCH_SIZE, std::num::NonZeroUsize::get);
+            let tracked = (0..=batch_size)
+                .map(|idx| {
+                    TrackedTableMutation::new(
+                        EventSequenceKey::new(PgLsn::from(200 + idx as u64), 0),
+                        TableMutation::Delete(OldTableRow::Full(TableRow::new(vec![
+                            Cell::I32(idx as i32),
+                            Cell::String(format!("name-{idx}")),
+                        ]))),
+                    )
+                })
+                .collect();
+            let batches = prepare_mutation_table_batches(
+                configured_size,
+                &replicated_table_schema,
+                ducklake_table_name(),
+                LEGACY_REPLAY_EPOCH.to_owned(),
+                tracked,
+            )
+            .unwrap();
 
-        assert_eq!(batches.len(), 2);
+            assert_eq!(batches.len(), 2);
 
-        match &batches[0].action {
-            PreparedDuckLakeTableBatchAction::Mutation(prepared) => match &prepared[0] {
-                PreparedTableMutation::Delete { predicates, .. } => {
-                    assert_eq!(predicates.len(), CDC_MUTATION_BATCH_SIZE);
-                }
-                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
-                    panic!("expected delete batch")
-                }
-            },
-            PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
-        }
+            match &batches[0].action {
+                PreparedDuckLakeTableBatchAction::Mutation(prepared) => match &prepared[0] {
+                    PreparedTableMutation::Delete { predicates, .. } => {
+                        assert_eq!(predicates.len(), batch_size);
+                    }
+                    PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
+                        panic!("expected delete batch")
+                    }
+                },
+                PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
+            }
 
-        match &batches[1].action {
-            PreparedDuckLakeTableBatchAction::Mutation(prepared) => match &prepared[0] {
-                PreparedTableMutation::Delete { predicates, .. } => {
-                    assert_eq!(predicates.len(), 1);
-                }
-                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
-                    panic!("expected delete batch")
-                }
-            },
-            PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
+            match &batches[1].action {
+                PreparedDuckLakeTableBatchAction::Mutation(prepared) => match &prepared[0] {
+                    PreparedTableMutation::Delete { predicates, .. } => {
+                        assert_eq!(predicates.len(), 1);
+                    }
+                    PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
+                        panic!("expected delete batch")
+                    }
+                },
+                PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
+            }
         }
     }
 
@@ -3412,6 +3446,7 @@ mod tests {
     fn prepare_mutation_table_batches_isolate_update_in_its_own_atomic_batch() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            None,
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),

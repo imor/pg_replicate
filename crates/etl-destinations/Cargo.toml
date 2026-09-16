@@ -13,7 +13,10 @@ homepage.workspace = true
 doctest = false
 
 [features]
-default = ["tls-rustls-ring"]
+# Explicit opt-in: database errors and SQL may contain source row values.
+ducklake-query-error-details = ["ducklake"]
+default = ["tls-rustls-ring", "bundled"]
+bundled = ["duckdb?/bundled", "duckdb?/json", "duckdb?/parquet", "etl-maintenance?/bundled"]
 tls-rustls-ring = [
     "etl/tls-rustls-ring",
     "etl-maintenance?/tls-rustls-ring",
@@ -112,7 +115,7 @@ base64 = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 chrono = { workspace = true, features = ["serde"] }
 clickhouse = { workspace = true, optional = true, features = ["inserter", "lz4", "rustls-tls"] }
-duckdb = { workspace = true, optional = true, features = ["appender-arrow", "bundled", "json", "parquet", "r2d2"] }
+duckdb = { workspace = true, optional = true, features = ["appender-arrow", "r2d2"] }
 etl = { workspace = true }
 etl-config = { workspace = true }
 etl-maintenance = { workspace = true, optional = true }

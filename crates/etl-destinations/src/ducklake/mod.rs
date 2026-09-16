@@ -2,6 +2,7 @@ mod batches;
 mod client;
 mod config;
 mod core;
+mod embedding;
 mod encoding;
 mod external_maintenance;
 mod inline_size;
@@ -88,7 +89,7 @@ impl DuckLakeTableName {
 
     /// Returns whether this is an internal ETL helper table.
     pub(super) fn is_internal_helper(&self) -> bool {
-        self.table.starts_with("__etl_")
+        self.table.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("__etl_"))
     }
 }
 
@@ -133,6 +134,7 @@ pub use batches::{
     reset_ducklake_test_hooks,
 };
 pub use config::S3Config;
+pub use duckdb::Connection;
 pub use etl_maintenance::ducklake::{
     CleanupOldFilesMaintenanceConfig, DuckLakeMaintenanceConfig, DuckLakeMaintenanceOutcome,
     ExpireSnapshotsMaintenanceConfig, InlineFlushMaintenanceConfig,

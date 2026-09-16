@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroUsize,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -68,10 +69,11 @@ use crate::{
             run_duckdb_dedicated_blocking_with_context,
         },
         config::{
-            MIN_EXPIRE_SNAPSHOTS_OLDER_THAN, build_setup_plan, current_duckdb_extension_strategy,
-            maintenance_target_file_size_sql, resolve_expire_snapshots_older_than,
-            validate_expire_snapshots_older_than_sql,
+            DuckLakeSetupPlan, MIN_EXPIRE_SNAPSHOTS_OLDER_THAN, build_setup_plan,
+            current_duckdb_extension_strategy, maintenance_target_file_size_sql,
+            resolve_expire_snapshots_older_than, validate_expire_snapshots_older_than_sql,
         },
+        embedding::EmbeddingOptions,
         external_maintenance::ExternalMaintenanceOperations,
         inline_size::DuckLakePendingInlineSizeSampler,
         metrics::{
@@ -180,6 +182,68 @@ fn build_ducklake_metadata_pg_pool(catalog_url: &Url) -> EtlResult<PgPool> {
         .acquire_timeout(std::time::Duration::from_secs(5))
         .idle_timeout(Some(std::time::Duration::from_secs(30)))
         .connect_lazy_with(options))
+}
+
+/// Drains accepted table work and reports every failure before returning one.
+async fn finish_table_tasks(tasks: &mut tokio::task::JoinSet<EtlResult<()>>) -> EtlResult<()> {
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        let result = result.map_err(|source| etl_error!(ErrorKind::ApplyWorkerPanic, "DuckLake table task failed", source: source)).and_then(|result| result);
+        if let Err(error) = result {
+            // A returned error may carry opt-in row-bearing diagnostics.
+            // Automatic logs keep only the owned description and error kind.
+            tracing::error!(error = error.description().unwrap_or("DuckLake table task failed"), error_kind = ?error.kind(), "ducklake table task failed");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Rejects destination names reserved for ETL replay bookkeeping.
+fn validate_ducklake_table_name(table_name: &DuckLakeTableName) -> EtlResult<()> {
+    if table_name.is_internal_helper() {
+        return Err(etl_error!(
+            ErrorKind::InvalidState,
+            "DuckLake destination table uses a reserved ETL helper name",
+            format!("Table {table_name} cannot be used for replication")
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects another source's durable claim before creating or recovering a
+/// table. Callers serialize initial creation with `table_creation_slots`;
+/// pending metadata reserves a name even when physical DDL has not completed.
+async fn ensure_unique_table_identity<S: DestinationStore>(
+    store: &S,
+    table_id: TableId,
+    table_name: &DuckLakeTableName,
+) -> EtlResult<()> {
+    validate_ducklake_table_name(table_name)?;
+    for schema in store.get_table_schemas().await? {
+        if schema.id != table_id
+            && let Some(metadata) = store.get_destination_table_metadata(schema.id).await?
+            && let owner = DuckLakeTableName::from_metadata_id(metadata.table_id())?
+            // DuckDB resolves even quoted identifiers using ASCII case folding.
+            && owner.schema().eq_ignore_ascii_case(table_name.schema())
+            && owner.table().eq_ignore_ascii_case(table_name.table())
+        {
+            return Err(etl_error!(
+                ErrorKind::InvalidState,
+                "DuckLake destination table is already owned by another source",
+                format!(
+                    "Table {table_name} is owned by source {}; cannot assign it to {table_id}",
+                    schema.id
+                )
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Returns whether a DuckLake DDL error indicates another transaction already
@@ -509,6 +573,8 @@ impl DuckLakePoolHandle {
 /// deferred to coordinated maintenance.
 #[derive(Clone)]
 pub struct DuckLakeDestination<S> {
+    /// Host policies retained across destination clones and pool replacement.
+    embedding: EmbeddingOptions,
     manager: Arc<DuckLakeConnectionManager>,
     /// Connection manager for the pool dedicated to initial-copy writes.
     copy_manager: DuckLakeConnectionManager,
@@ -568,6 +634,8 @@ pub struct DuckLakeDestination<S> {
 /// policies start with their existing defaults and can be configured without
 /// adding another constructor for each combination.
 pub struct DuckLakeDestinationBuilder<S> {
+    /// Optional host initialization and table mapping.
+    embedding: EmbeddingOptions,
     /// DuckLake PostgreSQL catalog URL.
     catalog_url: Url,
     /// Parquet data path.
@@ -601,6 +669,7 @@ impl<S> DuckLakeDestinationBuilder<S> {
     /// defaulted.
     fn new(catalog_url: Url, data_path: Url, pool_size: u32, store: S) -> Self {
         Self {
+            embedding: EmbeddingOptions::default(),
             catalog_url,
             data_path,
             pool_size,
@@ -615,6 +684,52 @@ impl<S> DuckLakeDestinationBuilder<S> {
             external_maintenance: DuckLakeExternalMaintenanceConfig::default(),
             store,
         }
+    }
+
+    /// Uses a host-initialized DuckDB instance instead of the default setup.
+    ///
+    /// Called on a blocking thread at startup and on each pool replacement.
+    /// Return a fresh instance with DuckLake attached as `lake`, using the same
+    /// catalog, metadata schema and data path passed to this builder. The host
+    /// owns extension loading, secrets, resource limits, attachment options and
+    /// catalog writer options for both COPY and CDC. Standalone S3, Parquet
+    /// setup and temporary COPY inlining overrides are bypassed.
+    /// ETL still configures writer sessions and manages replay helper tables.
+    /// Do not retain connections to retired instances in the callback.
+    pub fn connection_initializer<F>(mut self, initialize: F) -> Self
+    where
+        F: Fn() -> EtlResult<duckdb::Connection> + Send + Sync + 'static,
+    {
+        self.embedding.connection_initializer = Some(Arc::new(initialize));
+        self
+    }
+
+    /// Maps newly discovered tables to their durable destination names.
+    ///
+    /// The mapping must be deterministic, injective under ASCII
+    /// case-insensitive identifier comparison, and avoid the reserved
+    /// `__etl_` prefix in any case. Invalid names and identities already
+    /// owned by another source are rejected. Existing tables retain their
+    /// stored identity, including after a restart or a source rename;
+    /// changing this callback does not move data. Table sorting policies
+    /// refer to the resulting destination names.
+    pub fn table_name_mapper<F>(mut self, map: F) -> Self
+    where
+        F: Fn(&TableName) -> EtlResult<DuckLakeTableName> + Send + Sync + 'static,
+    {
+        self.embedding.table_name_mapper = Some(Arc::new(map));
+        self
+    }
+
+    /// Sets the maximum number of CDC mutations in one DuckLake transaction.
+    ///
+    /// Defaults to 16. Larger transactions can reduce file creation when data
+    /// inlining is disabled, at the cost of longer transactions and retries.
+    /// This only groups mutations already delivered by the pipeline; it does
+    /// not wait for additional events or change the pipeline batch limits.
+    pub fn cdc_batch_size(mut self, size: NonZeroUsize) -> Self {
+        self.embedding.cdc_batch_size = Some(size);
+        self
     }
 
     /// Sets optional S3 credentials and endpoint configuration.
@@ -706,6 +821,7 @@ where
             self.copy_buffer_config,
             self.table_sorting,
             self.external_maintenance,
+            self.embedding,
             self.store,
         )
         .await
@@ -1743,6 +1859,7 @@ where
             DuckLakeCopyBufferConfig::default(),
             DuckLakeTableSortingConfig::default(),
             DuckLakeExternalMaintenanceConfig::default(),
+            EmbeddingOptions::default(),
             store,
         )
         .await
@@ -1811,6 +1928,7 @@ where
         copy_buffer_config: DuckLakeCopyBufferConfig,
         table_sorting: DuckLakeTableSortingConfig,
         external_maintenance: DuckLakeExternalMaintenanceConfig,
+        embedding: EmbeddingOptions,
         store: S,
     ) -> EtlResult<Self> {
         register_metrics();
@@ -1848,60 +1966,80 @@ where
         }
         let table_sorting = Arc::new(index_table_sorting_config(table_sorting)?);
 
-        let extension_strategy = current_duckdb_extension_strategy()?;
-        let disable_extension_autoload = extension_strategy.disables_autoload();
         let target_file_size = Arc::<str>::from(writer_config.target_file_size());
         let expire_snapshots_older_than = Arc::<str>::from(
             resolve_expire_snapshots_older_than(expire_snapshots_older_than.as_deref()).to_owned(),
         );
-        if let crate::ducklake::config::DuckDbExtensionStrategy::VendoredLocal { platform_dir } =
-            extension_strategy
-        {
-            info!(platform = platform_dir, "using vendored duckdb extensions");
-        }
-        let setup_plan = Arc::new(build_setup_plan(
-            &catalog_url,
-            &data_path,
-            s3.as_ref(),
-            metadata_schema.as_deref(),
-            &writer_config,
-            ATTACH_DATA_INLINING_ROW_LIMIT,
-        )?);
+        let custom_initialization = embedding.connection_initializer.is_some();
+        let (setup_plan, disable_extension_autoload) = if custom_initialization {
+            (Arc::new(DuckLakeSetupPlan::for_embedded_instance()), false)
+        } else {
+            let extension_strategy = current_duckdb_extension_strategy()?;
+            let disable_extension_autoload = extension_strategy.disables_autoload();
+            if let crate::ducklake::config::DuckDbExtensionStrategy::VendoredLocal {
+                platform_dir,
+            } = extension_strategy
+            {
+                info!(platform = platform_dir, "using vendored duckdb extensions");
+            }
+            let setup_plan = Arc::new(build_setup_plan(
+                &catalog_url,
+                &data_path,
+                s3.as_ref(),
+                metadata_schema.as_deref(),
+                &writer_config,
+                ATTACH_DATA_INLINING_ROW_LIMIT,
+            )?);
+
+            (setup_plan, disable_extension_autoload)
+        };
 
         let interrupt_registry = Arc::new(DuckLakeInterruptRegistry::default());
         let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let manager = DuckLakeConnectionManager::new(
-            setup_plan,
-            disable_extension_autoload,
-            interrupt_registry,
-            shutdown_requested,
-        )
-        .await?;
+        let manager = if embedding.connection_initializer.is_some() {
+            DuckLakeConnectionManager::new_with_initializer(
+                setup_plan,
+                disable_extension_autoload,
+                interrupt_registry,
+                shutdown_requested,
+                embedding.connection_initializer.clone(),
+            )
+            .await?
+        } else {
+            DuckLakeConnectionManager::new(
+                setup_plan,
+                disable_extension_autoload,
+                interrupt_registry,
+                shutdown_requested,
+            )
+            .await?
+        };
         let copy_manager = manager.new_pool_manager();
         let manager = Arc::new(manager);
         let pool =
             Arc::new(build_warm_ducklake_pool(manager.as_ref().clone(), pool_size, "write").await?);
         let blocking_slots = Arc::new(Semaphore::new(pool_size as usize));
 
-        // `target_file_size` is a catalog-wide DuckLake option consumed during
-        // compaction. Apply it once on the write pool so foreground writes and
-        // external maintenance jobs use the same configured catalog option.
-        let target_file_size_sql = maintenance_target_file_size_sql(target_file_size.as_ref());
-        run_duckdb_blocking(
-            Arc::clone(&pool),
-            Arc::clone(&blocking_slots),
-            move |conn| -> EtlResult<()> {
-                conn.execute_batch(&target_file_size_sql).map_err(|error| {
-                    etl_error!(
-                        ErrorKind::DestinationQueryFailed,
-                        "DuckLake target_file_size configuration failed",
-                        source: error
-                    )
-                })?;
-                Ok(())
-            },
-        )
-        .await?;
+        // A host initializer owns catalog options, including schema-scoped
+        // target sizes. Only standalone setup applies the catalog-wide default.
+        if !custom_initialization {
+            let target_file_size_sql = maintenance_target_file_size_sql(target_file_size.as_ref());
+            run_duckdb_blocking(
+                Arc::clone(&pool),
+                Arc::clone(&blocking_slots),
+                move |conn| -> EtlResult<()> {
+                    conn.execute_batch(&target_file_size_sql).map_err(|error| {
+                        etl_error!(
+                            ErrorKind::DestinationQueryFailed,
+                            "DuckLake target_file_size configuration failed",
+                            source: error
+                        )
+                    })?;
+                    Ok(())
+                },
+            )
+            .await?;
+        }
         let expire_snapshots_validation_sql =
             validate_expire_snapshots_older_than_sql(expire_snapshots_older_than.as_ref());
         let expire_snapshots_older_than_for_error = Arc::clone(&expire_snapshots_older_than);
@@ -2004,6 +2142,7 @@ where
         let checkpoint_gate = Arc::new(RwLock::new(()));
         let copy_session_gate = Arc::new(RwLock::new(()));
         let mut destination = Self {
+            embedding,
             manager: Arc::clone(&manager),
             copy_manager,
             pools,
@@ -2241,6 +2380,12 @@ where
         &self,
         table_name: &DuckLakeTableName,
     ) -> EtlResult<()> {
+        // Host setup owns inlining for both COPY and CDC. Do not introduce a
+        // table override that would mask its attachment or schema settings.
+        if self.embedding.connection_initializer.is_some() {
+            return Ok(());
+        }
+
         if self.copy_direct_to_parquet_tables.lock().contains(table_name) {
             return Ok(());
         }
@@ -2256,6 +2401,12 @@ where
         &self,
         table_name: &DuckLakeTableName,
     ) -> EtlResult<()> {
+        // Host setup owns inlining for both COPY and CDC. Do not introduce a
+        // table override that would mask its attachment or schema settings.
+        if self.embedding.connection_initializer.is_some() {
+            return Ok(());
+        }
+
         self.set_copy_data_inlining_row_limit(table_name, ATTACH_DATA_INLINING_ROW_LIMIT).await?;
         self.copy_direct_to_parquet_tables.lock().remove(table_name);
         Ok(())
@@ -3083,6 +3234,7 @@ where
             };
 
             let table_name = DuckLakeTableName::from_metadata_id(metadata.table_id())?;
+            ensure_unique_table_identity(&self.store, table_id, &table_name).await?;
             if metadata.is_pending() {
                 self.recover_pending_metadata(table_id, &table_name, metadata, None).await?;
                 continue;
@@ -3287,6 +3439,7 @@ where
                             );
 
                             let prepared_batches = prepare_mutation_table_batches(
+                                destination.embedding.cdc_batch_size,
                                 &segment.replicated_table_schema,
                                 destination_table_name.clone(),
                                 replay_epoch,
@@ -3309,11 +3462,7 @@ where
                     });
                 }
 
-                while let Some(result) = join_set.join_next().await {
-                    result.map_err(|_| {
-                        etl_error!(ErrorKind::ApplyWorkerPanic, "DuckLake write task panicked")
-                    })??;
-                }
+                finish_table_tasks(&mut join_set).await?;
             }
 
             // Apply schema changes sequentially before any later row events
@@ -3403,11 +3552,7 @@ where
                     });
                 }
 
-                while let Some(result) = join_set.join_next().await {
-                    result.map_err(|_| {
-                        etl_error!(ErrorKind::ApplyWorkerPanic, "DuckLake truncate task panicked")
-                    })??;
-                }
+                finish_table_tasks(&mut join_set).await?;
             }
         }
 
@@ -3423,6 +3568,7 @@ where
         replicated_table_schema: &ReplicatedTableSchema,
     ) -> EtlResult<()> {
         validate_ducklake_table_shape(replicated_table_schema)?;
+        ensure_unique_table_identity(&self.store, table_id, table_name).await?;
         let metadata = DestinationTableMetadata::new_creating(
             table_name.to_metadata_id()?,
             replicated_table_schema.inner().snapshot_id,
@@ -3620,7 +3766,7 @@ where
         let table_id = replicated_table_schema.id();
         let metadata = self.store.get_destination_table_metadata(table_id).await?;
         let table_name = metadata.as_ref().map_or_else(
-            || table_name_to_ducklake_table_name(replicated_table_schema.name()),
+            || self.map_new_table_name(replicated_table_schema.name()),
             |metadata| DuckLakeTableName::from_metadata_id(metadata.table_id()),
         )?;
 
@@ -3654,7 +3800,7 @@ where
 
         let metadata = self.store.get_destination_table_metadata(table_id).await?;
         let table_name = metadata.as_ref().map_or_else(
-            || table_name_to_ducklake_table_name(replicated_table_schema.name()),
+            || self.map_new_table_name(replicated_table_schema.name()),
             |metadata| DuckLakeTableName::from_metadata_id(metadata.table_id()),
         )?;
 
@@ -3772,6 +3918,16 @@ where
         .await
     }
 
+    /// Maps a table only before its durable destination identity exists.
+    fn map_new_table_name(&self, source: &TableName) -> EtlResult<DuckLakeTableName> {
+        let table_name = match &self.embedding.table_name_mapper {
+            Some(map) => map(source),
+            None => table_name_to_ducklake_table_name(source),
+        }?;
+        validate_ducklake_table_name(&table_name)?;
+        Ok(table_name)
+    }
+
     /// Returns the stored destination table name or the deterministic default.
     async fn resolve_destination_table_name(
         &self,
@@ -3783,7 +3939,7 @@ where
             return DuckLakeTableName::from_metadata_id(existing.table_id());
         }
 
-        table_name_to_ducklake_table_name(replicated_table_schema.name())
+        self.map_new_table_name(replicated_table_schema.name())
     }
 
     /// Serializes table-local truncate and CDC mutation writes.
@@ -4315,6 +4471,34 @@ pub fn table_name_to_ducklake_table_name(table_name: &TableName) -> EtlResult<Du
     Ok(DuckLakeTableName::from_source(table_name))
 }
 
+impl<S: DestinationStore> DuckLakeDestination<S> {
+    /// Runs host maintenance on the writer instance while mutations are paused.
+    ///
+    /// The operation runs on a blocking thread under the normal query watchdog.
+    /// Its pause guard survives cancellation until the native operation exits.
+    /// Finish all transactions before returning, and do not retain or clone the
+    /// connection outside the operation. Scheduling and table selection belong
+    /// to the caller; this method does not retry a partially completed
+    /// operation.
+    pub async fn run_maintenance<R, F>(&self, timeout: Duration, operation: F) -> EtlResult<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&duckdb::Connection) -> EtlResult<R> + Send + 'static,
+    {
+        let pause = self.acquire_external_maintenance_pause().await;
+        crate::ducklake::client::run_duckdb_blocking_with_timeout(
+            self.streaming_pool()?,
+            Arc::clone(&self.blocking_slots),
+            timeout,
+            move |connection| {
+                let _pause = pause;
+                operation(connection)
+            },
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -4333,7 +4517,7 @@ mod tests {
             ColumnMetadataChange, ColumnSchema, IdentityMask, ReplicationMask, SchemaDiff,
             TableSchema, Type as PgType,
         },
-        store::{MemoryStore, SchemaStore},
+        store::{MemoryStore, SchemaStore, StateStore},
     };
     use etl_maintenance::ducklake::flush_table_inlined_data;
     use etl_postgres::{test_utils::local_tls_config_from_env, tokio::test_utils::PgDatabase};
@@ -4358,6 +4542,24 @@ mod tests {
 
         let batch_id = NEXT_BATCH_ID.fetch_add(1, Ordering::Relaxed);
         TableCopyBatchId::new(TableCopyAttemptId::from_u128(1), batch_id)
+    }
+
+    #[tokio::test]
+    async fn failing_table_does_not_abort_other_accepted_work() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let other_completed = Arc::clone(&completed);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async {
+            Err(etl_error!(ErrorKind::DestinationQueryFailed, "First write failed"))
+        });
+        tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            other_completed.store(true, Ordering::SeqCst);
+            Err(etl_error!(ErrorKind::DestinationQueryFailed, "Second write failed"))
+        });
+        assert!(finish_table_tasks(&mut tasks).await.is_err());
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(tasks.is_empty());
     }
 
     #[test]
@@ -5702,5 +5904,99 @@ mod tests {
             assert!(metrics.files_scheduled_for_deletion_bytes >= 0);
             assert!(metrics.oldest_scheduled_deletion_age_seconds >= 0);
         }
+    }
+    #[tokio::test]
+    async fn mapped_table_identity_rejects_pending_and_applied_owners() {
+        let store = MemoryStore::new();
+        let first = make_schema(1, "public", "first");
+        let second = make_schema(2, "public", "second");
+        store.store_table_schema(first.clone()).await.unwrap();
+        store.store_table_schema(second.clone()).await.unwrap();
+        let name = ducklake_table_name();
+        let schema = ReplicatedTableSchema::all(Arc::new(first.clone()));
+        let pending = DestinationTableMetadata::new_creating(
+            name.to_metadata_id().unwrap(),
+            first.snapshot_id,
+            schema.replication_mask().clone(),
+        );
+        for metadata in [pending.clone(), pending.to_applied()] {
+            store.store_destination_table_metadata(first.id, metadata).await.unwrap();
+            ensure_unique_table_identity(&store, first.id, &name).await.unwrap();
+            for candidate in [
+                name.clone(),
+                DuckLakeTableName::new("PUBLIC", "users"),
+                DuckLakeTableName::new("public", "Users"),
+                DuckLakeTableName::new("PUBLIC", "USERS"),
+            ] {
+                ensure_unique_table_identity(&store, first.id, &candidate).await.unwrap();
+                let error =
+                    ensure_unique_table_identity(&store, second.id, &candidate).await.unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::InvalidState);
+                assert!(store.get_destination_table_metadata(second.id).await.unwrap().is_none());
+            }
+            ensure_unique_table_identity(
+                &store,
+                second.id,
+                &DuckLakeTableName::new("other", "users"),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mapped_table_identity_rejects_reserved_helpers() {
+        let store = MemoryStore::new();
+        let schema = make_schema(1, "public", "users");
+        store.store_table_schema(schema.clone()).await.unwrap();
+        for table in [
+            "__etl_applied_table_batches",
+            "__etl_streaming_progress",
+            "__ETL_APPLIED_TABLE_BATCHES",
+            "__EtL_streaming_progress",
+        ] {
+            for namespace in ["main", "MAIN", "public"] {
+                let name = DuckLakeTableName::new(namespace, table);
+                let error =
+                    ensure_unique_table_identity(&store, schema.id, &name).await.unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::InvalidState);
+                assert!(store.get_destination_table_metadata(schema.id).await.unwrap().is_none());
+            }
+        }
+        for table in ["__etl", "__et", "users", "éééusers", "__étl_users"] {
+            ensure_unique_table_identity(&store, schema.id, &DuckLakeTableName::new("main", table))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mapped_table_identity_preserves_non_ascii_distinctions() {
+        let store = MemoryStore::new();
+        let first = make_schema(1, "public", "first");
+        let second = make_schema(2, "public", "second");
+        store.store_table_schema(first.clone()).await.unwrap();
+        store.store_table_schema(second.clone()).await.unwrap();
+        let name = DuckLakeTableName::new("schéma", "Üsers");
+        let schema = ReplicatedTableSchema::all(Arc::new(first.clone()));
+        let metadata = DestinationTableMetadata::new_creating(
+            name.to_metadata_id().unwrap(),
+            first.snapshot_id,
+            schema.replication_mask().clone(),
+        );
+        store.store_destination_table_metadata(first.id, metadata).await.unwrap();
+        for candidate in
+            [DuckLakeTableName::new("schéma", "üsers"), DuckLakeTableName::new("schÉma", "Üsers")]
+        {
+            ensure_unique_table_identity(&store, second.id, &candidate).await.unwrap();
+        }
+        let error = ensure_unique_table_identity(
+            &store,
+            second.id,
+            &DuckLakeTableName::new("SCHéMA", "ÜSERS"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidState);
     }
 }

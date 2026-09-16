@@ -81,7 +81,7 @@ constant_time_eq = { version = "0.4.2" }
 duckdb = { version = "1", default-features = false }
 etl = { path = "crates/etl", default-features = false }
 etl-config = { path = "crates/etl-config", default-features = false }
-etl-destinations = { path = "crates/etl-destinations", default-features = false }
+etl-destinations = { path = "crates/etl-destinations", default-features = false, features = ["bundled"] }
 etl-maintenance = { path = "crates/etl-maintenance", default-features = false }
 etl-postgres = { path = "crates/etl-postgres", default-features = false }
 etl-telemetry = { path = "crates/etl-telemetry", default-features = false }

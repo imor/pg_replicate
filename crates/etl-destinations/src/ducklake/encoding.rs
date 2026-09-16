@@ -607,7 +607,8 @@ fn float_literal(value: f64, is_double: bool) -> String {
         };
     }
 
-    value.to_string()
+    let typ = if is_double { "DOUBLE" } else { "FLOAT" };
+    format!("CAST('{value:e}' AS {typ})")
 }
 
 /// Encodes bytes as uppercase hexadecimal for DuckDB's `from_hex`.
@@ -728,6 +729,28 @@ mod tests {
             TableName::new("public".to_owned(), "users".to_owned()),
             columns,
         )))
+    }
+
+    #[test]
+    fn sql_float_literals_preserve_bits() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        for value in [-0.0_f64, f64::MIN_POSITIVE, f64::from_bits(1), 1.0000000000000002, f64::MAX]
+        {
+            let actual: f64 = conn
+                .query_row(&format!("select {}", float_literal(value, true)), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(actual.to_bits(), value.to_bits());
+        }
+        for value in [-0.0_f32, f32::MIN_POSITIVE, f32::from_bits(1), 1.0000001, f32::MAX] {
+            let actual: f32 = conn
+                .query_row(
+                    &format!("select {}", float_literal(f64::from(value), false)),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual.to_bits(), value.to_bits());
+        }
     }
 
     #[test]

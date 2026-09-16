@@ -1915,3 +1915,105 @@ async fn schema_change_matches_simulator_generated_column_types() {
         }
     );
 }
+
+/// Embeds the stock destination with host setup, routing and maintenance.
+#[tokio::test(flavor = "multi_thread")]
+async fn embedded_destination_keeps_copy_cdc_and_maintenance_on_one_instance() {
+    use std::time::Duration;
+
+    use etl::{error::ErrorKind, etl_error};
+
+    init_test_tracing();
+    let database = spawn_source_database().await;
+    let schema = setup_test_database_schema(&database, TableSelection::UsersOnly).await;
+    let users = schema.users_schema();
+    database.insert_values(users.name.clone(), &["name", "age"], &[&"before", &1]).await.unwrap();
+    let lake = create_test_lake("embedded_destination").await;
+    let store = NotifyingStore::new();
+    let setup = format!(
+        "{} attach {} as lake (data_path {}, data_inlining_row_limit 0); create table host_marker \
+         as select 42 as id;",
+        ducklake_load_sql(),
+        quote_literal(&format!("ducklake:{}", catalog_attach_target(&lake.catalog_url))),
+        quote_literal(lake.data_url.as_str()),
+    );
+    let raw = DuckLakeDestination::builder(lake.catalog_url.clone(), lake.data_url.clone(), 1, store.clone())
+        .connection_initializer(move || {
+            let conn = Connection::open_in_memory().map_err(|source| {
+                etl_error!(ErrorKind::DestinationConnectionFailed, "Host open failed", source: source)
+            })?;
+            conn.execute_batch(&setup).map_err(|source| {
+                etl_error!(ErrorKind::DestinationQueryFailed, "Host setup failed", source: source)
+            })?;
+            Ok(conn)
+        })
+        .table_name_mapper(|name| Ok(DuckLakeTableName::new("replicated", format!("{}_{}", name.schema, name.name))))
+        .build().await.unwrap();
+    let wrapped = TestDestinationWrapper::wrap(raw.clone());
+    let ready = store.notify_on_table_sync_complete(users.id).await;
+    let mut pipeline = create_pipeline(
+        &database.config,
+        random(),
+        schema.publication_name(),
+        store.clone(),
+        wrapped.clone(),
+    );
+    pipeline.start().await.unwrap();
+    ready.notified().await;
+
+    // Cancelling the caller must not release the pause around native work.
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let maintenance_destination = raw.clone();
+    let maintenance = tokio::spawn(async move {
+        maintenance_destination.run_maintenance(Duration::from_secs(30), move |conn| {
+            let marker: i64 = conn.query_row("select id from host_marker", [], |row| row.get(0)).map_err(|source| {
+                etl_error!(ErrorKind::DestinationQueryFailed, "Marker query failed", source: source)
+            })?;
+            assert_eq!(marker, 42);
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            Ok(())
+        }).await
+    });
+    started_rx.await.unwrap();
+    maintenance.abort();
+    assert!(maintenance.await.unwrap_err().is_cancelled());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), raw.acquire_external_maintenance_pause())
+            .await
+            .is_err()
+    );
+    release_tx.send(()).unwrap();
+    drop(
+        tokio::time::timeout(Duration::from_secs(10), raw.acquire_external_maintenance_pause())
+            .await
+            .unwrap(),
+    );
+
+    let inserted = wrapped
+        .wait_for_events(vec![EventCondition::TableCount(EventType::Insert, users.id, 1)])
+        .await;
+    database.insert_values(users.name.clone(), &["name", "age"], &[&"after", &2]).await.unwrap();
+    inserted.notified().await;
+    let mapped_for_inline_check =
+        DuckLakeTableName::new("replicated", format!("{}_{}", users.name.schema, users.name.name));
+    let flushed = raw.run_maintenance(Duration::from_secs(30), move |conn| {
+        let sql = format!("select coalesce(sum(rows_flushed), 0) from ducklake_flush_inlined_data('lake', {}, schema => {})", quote_literal(mapped_for_inline_check.table()), quote_literal(mapped_for_inline_check.schema()));
+        conn.query_row(&sql, [], |row| row.get::<_, i64>(0)).map_err(|source| {
+            etl_error!(ErrorKind::DestinationQueryFailed, "Inline verification failed", source: source)
+        })
+    }).await.unwrap();
+    assert_eq!(flushed, 0);
+    pipeline.shutdown_and_wait().await.unwrap();
+    drop(wrapped);
+    drop(raw);
+    checkpoint_lake(&lake.catalog_url, &lake.data_url);
+    let conn = open_lake_conn(&lake.catalog_url, &lake.data_url);
+    let mapped =
+        DuckLakeTableName::new("replicated", format!("{}_{}", users.name.schema, users.name.name));
+    assert_eq!(
+        query_user_rows(&conn, &mapped),
+        vec![(1, "before".to_owned(), 1), (2, "after".to_owned(), 2)]
+    );
+}

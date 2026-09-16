@@ -11,7 +11,8 @@ homepage.workspace = true
 doctest = false
 
 [features]
-default = ["tls-rustls-ring"]
+default = ["tls-rustls-ring", "bundled"]
+bundled = ["duckdb?/bundled", "duckdb?/json", "duckdb?/parquet"]
 tls-rustls-ring = ["sqlx/tls-rustls-ring", "etl/tls-rustls-ring"]
 tls-rustls-aws-lc-rs = ["sqlx/tls-rustls-aws-lc-rs", "etl/tls-rustls-aws-lc-rs"]
 ducklake = [
@@ -31,7 +32,7 @@ test-utils = []
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-duckdb = { workspace = true, optional = true, features = ["bundled", "json", "parquet", "r2d2"] }
+duckdb = { workspace = true, optional = true, features = ["r2d2"] }
 etl = { workspace = true }
 etl-config = { workspace = true }
 kube = { workspace = true, optional = true, features = ["client", "rustls-tls"] }

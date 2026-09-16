@@ -105,6 +105,17 @@ pub(super) struct DuckLakeSetupPlan {
 }
 
 impl DuckLakeSetupPlan {
+    /// Retains connection-local writer settings for a host-initialized
+    /// database.
+    pub(super) fn for_embedded_instance() -> Self {
+        Self {
+            steps: vec![DuckLakeSetupStep {
+                label: "configure_writer_session",
+                sql: configure_writer_session_sql(),
+            }],
+        }
+    }
+
     /// Returns the ordered setup steps.
     pub(super) fn steps(&self) -> &[DuckLakeSetupStep] {
         &self.steps

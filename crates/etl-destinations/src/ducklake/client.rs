@@ -26,6 +26,7 @@ use tracing::{info, trace, warn};
 
 use crate::ducklake::{
     config::{DuckLakeSetupPlan, DuckLakeSetupStep},
+    embedding::ConnectionInitializer,
     metrics::{
         ETL_DUCKLAKE_BLOCKING_OPERATION_DURATION_SECONDS, ETL_DUCKLAKE_BLOCKING_SLOT_WAIT_SECONDS,
         ETL_DUCKLAKE_POOL_CHECKOUT_WAIT_SECONDS,
@@ -363,6 +364,9 @@ pub(super) struct DuckLakeConnectionManager {
     pub(super) shutdown_requested: Arc<AtomicBool>,
     /// Anchor connection used to clone pooled connections from one database.
     shared_instance: Arc<Mutex<duckdb::Connection>>,
+    /// Recreates host-specific configuration and credentials on every
+    /// generation.
+    connection_initializer: Option<ConnectionInitializer>,
     /// Counts successfully initialized DuckDB connections for tests.
     #[cfg(feature = "test-utils")]
     pub(super) open_count: Arc<AtomicUsize>,
@@ -562,8 +566,30 @@ impl DuckLakeConnectionManager {
         interrupt_registry: Arc<DuckLakeInterruptRegistry>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> EtlResult<Self> {
+        Self::new_with_initializer(
+            setup_plan,
+            disable_extension_autoload,
+            interrupt_registry,
+            shutdown_requested,
+            None,
+        )
+        .await
+    }
+
+    /// Creates a manager with an optional host-owned instance initializer.
+    pub(super) async fn new_with_initializer(
+        setup_plan: Arc<DuckLakeSetupPlan>,
+        disable_extension_autoload: bool,
+        interrupt_registry: Arc<DuckLakeInterruptRegistry>,
+        shutdown_requested: Arc<AtomicBool>,
+        connection_initializer: Option<ConnectionInitializer>,
+    ) -> EtlResult<Self> {
+        let initialize = connection_initializer.clone();
         let setup_plan_for_initialization = Arc::clone(&setup_plan);
         let instance = tokio::task::spawn_blocking(move || {
+            if let Some(initialize) = initialize {
+                return initialize();
+            }
             Self::open_initialized_duckdb_instance(
                 setup_plan_for_initialization.as_ref(),
                 disable_extension_autoload,
@@ -590,6 +616,7 @@ impl DuckLakeConnectionManager {
             interrupt_registry,
             shutdown_requested,
             shared_instance: Arc::new(Mutex::new(instance)),
+            connection_initializer,
             #[cfg(feature = "test-utils")]
             open_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -603,6 +630,7 @@ impl DuckLakeConnectionManager {
             interrupt_registry: Arc::clone(&self.interrupt_registry),
             shutdown_requested: Arc::clone(&self.shutdown_requested),
             shared_instance: Arc::clone(&self.shared_instance),
+            connection_initializer: self.connection_initializer.clone(),
             #[cfg(feature = "test-utils")]
             open_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -700,18 +728,23 @@ impl DuckLakeConnectionManager {
         let shared_instance = Arc::clone(&self.shared_instance);
         let setup_plan = Arc::clone(&self.setup_plan);
         let disable_extension_autoload = self.disable_extension_autoload;
+        let initialize = self.connection_initializer.clone();
         tokio::task::spawn_blocking(move || -> EtlResult<()> {
-            let instance = Self::open_initialized_duckdb_instance(
-                setup_plan.as_ref(),
-                disable_extension_autoload,
-            )
-            .map_err(|error| {
-                etl_error!(
-                    ErrorKind::DestinationConnectionFailed,
-                    "Failed to recreate shared DuckLake DuckDB instance",
-                    source: error
+            let instance = if let Some(initialize) = initialize {
+                initialize()?
+            } else {
+                Self::open_initialized_duckdb_instance(
+                    setup_plan.as_ref(),
+                    disable_extension_autoload,
                 )
-            })?;
+                .map_err(|error| {
+                    etl_error!(
+                        ErrorKind::DestinationConnectionFailed,
+                        "Failed to recreate shared DuckLake DuckDB instance",
+                        source: error
+                    )
+                })?
+            };
             let mut current = shared_instance.lock().map_err(|_| {
                 etl_error!(
                     ErrorKind::InvalidState,
@@ -973,7 +1006,12 @@ where
 {
     let operation_kind = DUCKDB_BLOCKING_OPERATION_KIND;
     let operation_id = NEXT_DUCKDB_BLOCKING_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        etl_error!(ErrorKind::ConfigError, "DuckLake operation timeout is too large")
+    })?;
+    let abort_deadline = deadline.checked_add(BLOCKING_ABORT_GRACE).ok_or_else(|| {
+        etl_error!(ErrorKind::ConfigError, "DuckLake operation timeout leaves no abort grace")
+    })?;
     let slot_wait_started = Instant::now();
     let permit = tokio::time::timeout_at(deadline, Arc::clone(&blocking_slots).acquire_owned())
         .await
@@ -993,7 +1031,6 @@ where
     // connection active.
     let mut watchdog = DuckDbQueryWatchdog::spawn(deadline);
     let watchdog_task = watchdog.async_task_handle()?;
-    let abort_deadline = deadline + BLOCKING_ABORT_GRACE;
 
     let blocking_task = tokio::task::spawn_blocking(move || -> EtlResult<R> {
         // Please if you modify the code inside this blocking task do not add any
@@ -1099,6 +1136,7 @@ mod tests {
             interrupt_registry: Arc::new(DuckLakeInterruptRegistry::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shared_instance: Arc::new(Mutex::new(duckdb::Connection::open_in_memory().unwrap())),
+            connection_initializer: None,
             #[cfg(feature = "test-utils")]
             open_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -1308,6 +1346,26 @@ mod tests {
             expected_timed_out,
             "unexpected timeout state for watchdog sequence `{name}`"
         );
+    }
+
+    #[tokio::test]
+    async fn overflowing_timeout_returns_config_error_before_running_operation() {
+        let pool = Arc::new(
+            build_warm_ducklake_pool(make_blocking_test_manager(), 1, "test").await.unwrap(),
+        );
+        let slots = Arc::new(Semaphore::new(1));
+        let error = run_duckdb_blocking_with_timeout(
+            pool,
+            Arc::clone(&slots),
+            Duration::MAX,
+            |_| -> EtlResult<()> {
+                panic!("an invalid timeout must not start native work");
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ConfigError);
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -1861,5 +1919,73 @@ mod tests {
 
         let error = run_duckdb_blocking(pool, blocking_slots, |_| Ok(())).await.unwrap_err();
         assert!(is_ducklake_shutdown_requested_error(&error));
+    }
+
+    #[tokio::test]
+    async fn embedded_initializer_is_shared_and_repeated_on_recreation() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let initialize_calls = Arc::clone(&calls);
+        let initialize: ConnectionInitializer = Arc::new(move || {
+            let generation = initialize_calls.fetch_add(1, Ordering::SeqCst);
+            let connection = duckdb::Connection::open_in_memory().map_err(|source| {
+                etl_error!(ErrorKind::DestinationConnectionFailed, "Open failed", source: source)
+            })?;
+            connection.execute_batch(&format!(
+                "create table generation as select {generation} as id;"
+            )).map_err(|source| {
+                etl_error!(ErrorKind::DestinationQueryFailed, "Setup failed", source: source)
+            })?;
+            Ok(connection)
+        });
+        let manager = DuckLakeConnectionManager::new_with_initializer(
+            Arc::new(DuckLakeSetupPlan::for_embedded_instance()),
+            false,
+            Arc::new(DuckLakeInterruptRegistry::default()),
+            Arc::new(AtomicBool::new(false)),
+            Some(initialize),
+        )
+        .await
+        .unwrap();
+        let copy_manager = manager.new_pool_manager();
+        let first = manager.open_duckdb_connection().unwrap();
+        first.conn.execute_batch("insert into generation values (42)").unwrap();
+        let second = copy_manager.open_duckdb_connection().unwrap();
+        assert_eq!(
+            second
+                .conn
+                .query_row("select count(*) from generation", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(first);
+        drop(second);
+        manager.recreate_shared_instance().await.unwrap();
+        let recreated = copy_manager.open_duckdb_connection().unwrap();
+        assert_eq!(
+            recreated
+                .conn
+                .query_row("select id from generation", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn embedded_initializer_propagates_failures() {
+        let result = DuckLakeConnectionManager::new_with_initializer(
+            Arc::new(DuckLakeSetupPlan::for_embedded_instance()),
+            false,
+            Arc::new(DuckLakeInterruptRegistry::default()),
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(|| {
+                Err(etl_error!(ErrorKind::ConfigError, "Host initialization failed"))
+            })),
+        )
+        .await;
+        let error = result.err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::ConfigError);
+        assert!(error.to_string().contains("Host initialization failed"));
     }
 }
